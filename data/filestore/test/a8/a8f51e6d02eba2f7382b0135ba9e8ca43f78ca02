@@ -1,0 +1,863 @@
+
+/************************************************************
+*  Filepath: /web/static/src/legacy/js/services/session.js  *
+*  Bundle: web.report_assets_common                         *
+*  Lines: 11                                                *
+************************************************************/
+odoo.define('web.session', function (require) {
+"use strict";
+
+var Session = require('web.Session');
+
+var session = new Session(undefined, undefined, {use_cors: false});
+session.is_bound = session.session_bind();
+
+return session;
+
+});
+;
+
+/**************************************************************
+*  Filepath: /web/static/src/legacy/js/public/public_root.js  *
+*  Bundle: web.report_assets_common                           *
+*  Lines: 433                                                 *
+**************************************************************/
+odoo.define('@web/legacy/js/public/public_root', async function (require) {
+'use strict';
+let __exports = {};
+/** @odoo-module alias=web.public.root */
+
+const ajax = require('web.ajax');
+const dom = require('web.dom');
+const env = require('web.public_env');
+const session = require('web.session');
+const utils = require('web.utils');
+const publicWidget = require('web.public.widget');
+const { registry } = require('@web/core/registry');
+
+const AbstractService = require("web.AbstractService");
+const legacyEnv = require("web.public_env");
+const lazyloader = require("web.public.lazyloader");
+
+const {
+    makeLegacyNotificationService,
+    makeLegacyRpcService,
+    makeLegacySessionService,
+    makeLegacyDialogMappingService,
+    mapLegacyEnvToWowlEnv,
+    makeLegacyRainbowManService,
+} = require("@web/legacy/utils");
+const { ComponentAdapter } = require("web.OwlCompatibility");
+
+const { loadBundleTemplates } = require("@web/core/assets");
+const { makeEnv, startServices } = require("@web/env");
+const { MainComponentsContainer } = require("@web/core/main_components_container");
+const { browser } = require('@web/core/browser/browser');
+const { jsonrpc } = require('@web/core/network/rpc_service');
+const serviceRegistry = registry.category("services");
+
+// Load localizations outside the PublicRoot to not wait for DOM ready (but
+// wait for them in PublicRoot)
+function getLang() {
+    var html = document.documentElement;
+    return (html.getAttribute('lang') || 'en_US').replace('-', '_');
+}
+var lang = utils.get_cookie('frontend_lang') || getLang(); // FIXME the cookie value should maybe be in the ctx?
+// momentjs don't have config for en_US, so avoid useless RPC
+var localeDef = lang !== 'en_US' ? ajax.loadJS('/web/webclient/locale/' + lang.replace('-', '_')) : Promise.resolve();
+
+
+/**
+ * Element which is designed to be unique and that will be the top-most element
+ * in the widget hierarchy. So, all other widgets will be indirectly linked to
+ * this Class instance. Its main role will be to retrieve RPC demands from its
+ * children and handle them.
+ */
+const PublicRoot = __exports.PublicRoot = publicWidget.RootWidget.extend({
+    events: _.extend({}, publicWidget.RootWidget.prototype.events || {}, {
+        'submit .js_website_submit_form': '_onWebsiteFormSubmit',
+        'click .js_disable_on_click': '_onDisableOnClick',
+    }),
+    custom_events: _.extend({}, publicWidget.RootWidget.prototype.custom_events || {}, {
+        call_service: '_onCallService',
+        context_get: '_onContextGet',
+        main_object_request: '_onMainObjectRequest',
+        widgets_start_request: '_onWidgetsStartRequest',
+        widgets_stop_request: '_onWidgetsStopRequest',
+    }),
+
+    /**
+     * @constructor
+     */
+    init: function () {
+        this._super.apply(this, arguments);
+        this.env = env;
+        this.publicWidgets = [];
+    },
+    /**
+     * @override
+     */
+    willStart: function () {
+        // TODO would be even greater to wait for localeDef only when necessary
+        return Promise.all([
+            this._super.apply(this, arguments),
+            session.is_bound,
+            localeDef
+        ]);
+    },
+    /**
+     * @override
+     */
+    start: function () {
+        var defs = [
+            this._super.apply(this, arguments),
+            this._startWidgets()
+        ];
+
+        // Display image thumbnail
+        this.$(".o_image[data-mimetype^='image']").each(function () {
+            var $img = $(this);
+            if (/gif|jpe|jpg|png/.test($img.data('mimetype')) && $img.data('src')) {
+                $img.css('background-image', "url('" + $img.data('src') + "')");
+            }
+        });
+
+        // Auto scroll
+        if (window.location.hash.indexOf("scrollTop=") > -1) {
+            this.el.scrollTop = +window.location.hash.match(/scrollTop=([0-9]+)/)[1];
+        }
+
+        // Fix for IE:
+        if ($.fn.placeholder) {
+            $('input, textarea').placeholder();
+        }
+
+        this.$el.children().on('error.datetimepicker', this._onDateTimePickerError.bind(this));
+
+        return Promise.all(defs);
+    },
+
+    //--------------------------------------------------------------------------
+    // Private
+    //--------------------------------------------------------------------------
+
+    /**
+     * Retrieves the global context of the public environment. This is the
+     * context which is automatically added to each RPC.
+     *
+     * @private
+     * @param {Object} [context]
+     * @returns {Object}
+     */
+    _getContext: function (context) {
+        return _.extend({
+            'lang': getLang(),
+        }, context || {});
+    },
+    /**
+     * Retrieves the global context of the public environment (as
+     * @see _getContext) but with extra informations that would be useless to
+     * send with each RPC.
+     *
+     * @private
+     * @param {Object} [context]
+     * @returns {Object}
+     */
+    _getExtraContext: function (context) {
+        return this._getContext(context);
+    },
+    /**
+     * @private
+     * @param {Object} [options]
+     * @returns {Object}
+     */
+    _getPublicWidgetsRegistry: function (options) {
+        return publicWidget.registry;
+    },
+    /**
+     * As the root instance is designed to be unique, the associated
+     * registry has been instantiated outside of the class and is simply
+     * returned here.
+     *
+     * @private
+     * @override
+     */
+    _getRegistry: function () {
+        return registry.category("public_root_widgets");
+    },
+    /**
+     * Creates an PublicWidget instance for each DOM element which matches the
+     * `selector` key of one of the registered widgets
+     * (@see PublicWidget.selector).
+     *
+     * @private
+     * @param {jQuery} [$from]
+     *        only initialize the public widgets whose `selector` matches the
+     *        element or one of its descendant (default to the wrapwrap element)
+     * @param {Object} [options]
+     * @returns {Deferred}
+     */
+    _startWidgets: function ($from, options) {
+        var self = this;
+
+        if ($from === undefined) {
+            $from = this.$('#wrapwrap');
+            if (!$from.length) {
+                // TODO Remove this once all frontend layouts possess a
+                // #wrapwrap element (which is necessary for those pages to be
+                // adapted correctly if the user installs website).
+                $from = this.$el;
+            }
+        }
+
+        options = Object.assign({}, options, {
+            wysiwyg: $('#wrapwrap').data('wysiwyg'),
+        });
+
+        this._stopWidgets($from);
+
+        var defs = _.map(this._getPublicWidgetsRegistry(options), function (PublicWidget) {
+            var selector = PublicWidget.prototype.selector || '';
+            var $target = dom.cssFind($from, selector, true);
+
+            var defs = _.map($target, function (el) {
+                var widget = new PublicWidget(self, options);
+                self.publicWidgets.push(widget);
+                return widget.attachTo($(el));
+            });
+            return Promise.all(defs);
+        });
+        return Promise.all(defs);
+    },
+    /**
+     * Destroys all registered widget instances. Website would need this before
+     * saving while in edition mode for example.
+     *
+     * @private
+     * @param {jQuery} [$from]
+     *        only stop the public widgets linked to the given element(s) or one
+     *        of its descendants
+     */
+    _stopWidgets: function ($from) {
+        var removedWidgets = _.map(this.publicWidgets, function (widget) {
+            if (!$from
+                || $from.filter(widget.el).length
+                || $from.find(widget.el).length) {
+                widget.destroy();
+                return widget;
+            }
+            return null;
+        });
+        this.publicWidgets = _.difference(this.publicWidgets, removedWidgets);
+    },
+
+    //--------------------------------------------------------------------------
+    // Handlers
+    //--------------------------------------------------------------------------
+
+    /**
+     * Calls the requested service from the env. Automatically adds the global
+     * context to RPCs.
+     *
+     * @private
+     * @param {OdooEvent} event
+     */
+    _onCallService: function (ev) {
+        function _computeContext(context, noContextKeys) {
+            context = _.extend({}, this._getContext(), context);
+            if (noContextKeys) {
+                context = _.omit(context, noContextKeys);
+            }
+            return JSON.parse(JSON.stringify(context));
+        }
+
+        const payload = ev.data;
+        let args = payload.args || [];
+        if (payload.service === 'ajax' && payload.method === 'rpc') {
+            // ajax service uses an extra 'target' argument for rpc
+            args = args.concat(ev.target);
+
+            var route = args[0];
+            if (_.str.startsWith(route, '/web/dataset/call_kw/')) {
+                var params = args[1];
+                var options = args[2];
+                var noContextKeys;
+                if (options) {
+                    noContextKeys = options.noContextKeys;
+                    args[2] = _.omit(options, 'noContextKeys');
+                }
+                params.kwargs.context = _computeContext.call(this, params.kwargs.context, noContextKeys);
+            }
+        } else if (payload.service === 'ajax' && payload.method === 'loadLibs') {
+            args[1] = _computeContext.call(this, args[1]);
+        } else {
+            return;
+        }
+
+        const service = this.env.services[payload.service];
+        const result = service[payload.method].apply(service, args);
+        payload.callback(result);
+        ev.stopPropagation();
+    },
+    /**
+     * Called when someone asked for the global public context.
+     *
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onContextGet: function (ev) {
+        if (ev.data.extra) {
+            ev.data.callback(this._getExtraContext(ev.data.context));
+        } else {
+            ev.data.callback(this._getContext(ev.data.context));
+        }
+    },
+    /**
+     * Checks information about the page main object.
+     *
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onMainObjectRequest: function (ev) {
+        var repr = $('html').data('main-object');
+        var m = repr.match(/(.+)\((\d+),(.*)\)/);
+        ev.data.callback({
+            model: m[1],
+            id: m[2] | 0,
+        });
+    },
+    /**
+     * Called when the root is notified that the public widgets have to be
+     * (re)started.
+     *
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onWidgetsStartRequest: function (ev) {
+        this._startWidgets(ev.data.$target, ev.data.options)
+            .then(ev.data.onSuccess)
+            .guardedCatch(ev.data.onFailure);
+    },
+    /**
+     * Called when the root is notified that the public widgets have to be
+     * stopped.
+     *
+     * @private
+     * @param {OdooEvent} ev
+     */
+    _onWidgetsStopRequest: function (ev) {
+        this._stopWidgets(ev.data.$target);
+    },
+    /**
+     * @todo review
+     * @private
+     */
+    _onWebsiteFormSubmit: function (ev) {
+        var $buttons = $(ev.currentTarget).find('button[type="submit"], a.a-submit');
+        _.each($buttons, function (btn) {
+            var $btn = $(btn);
+            $btn.prepend('<i class="fa fa-circle-o-notch fa-spin"></i> ');
+            $btn.prop('disabled', true);
+        });
+    },
+    /**
+     * Called when the root is notified that the button should be
+     * disabled after the first click.
+     *
+     * @private
+     * @param {Event} ev
+     */
+    _onDisableOnClick: function (ev) {
+        $(ev.currentTarget).addClass('disabled');
+    },
+    /**
+     * Library clears the wrong date format so just ignore error
+     *
+     * @private
+     * @param {Event} ev
+     */
+    _onDateTimePickerError: function (ev) {
+        return false;
+    },
+});
+
+const { Component, mount } = owl;
+
+/**
+ * Configure Owl with the public env
+ */
+owl.config.mode = legacyEnv.isDebug() ? "dev" : "prod";
+owl.Component.env = legacyEnv;
+
+/**
+ * This widget is important, because the tour manager needs a root widget in
+ * order to work. The root widget must be a service provider with the ajax
+ * service, so that the tour manager can let the server know when tours have
+ * been consumed.
+ */
+__exports.createPublicRoot = createPublicRoot; async function createPublicRoot(RootWidget) {
+    await lazyloader.allScriptsLoaded;
+    AbstractService.prototype.deployServices(legacyEnv);
+    // add a bunch of mapping services that will redirect service calls from the legacy env
+    // to the wowl env
+    serviceRegistry.add("legacy_rpc", makeLegacyRpcService(legacyEnv));
+    serviceRegistry.add("legacy_session", makeLegacySessionService(legacyEnv, session));
+    serviceRegistry.add("legacy_notification", makeLegacyNotificationService(legacyEnv));
+    serviceRegistry.add("legacy_dialog_mapping", makeLegacyDialogMappingService(legacyEnv));
+    serviceRegistry.add("legacy_rainbowman_service", makeLegacyRainbowManService(legacyEnv));
+    await Promise.all([owl.utils.whenReady(), session.is_bound]);
+
+    // Patch browser.fetch and the rpc service to use the correct base url when
+    // embeded in an external page
+    const baseUrl = session.prefix;
+    const { fetch } = browser;
+    browser.fetch = function(url, ...args) {
+        if (!url.match(/^(?:https?:)?\/\//)) {
+            url = baseUrl + url;
+        }
+        return fetch(url, ...args);
+    }
+    serviceRegistry.add("rpc", {
+        async: true,
+        start(env) {
+            let rpcId = 0;
+            return function rpc(route, params = {}, settings) {
+                if (!route.match(/^(?:https?:)?\/\//)) {
+                    route = baseUrl + route;
+                }
+                return jsonrpc(env, rpcId++, route, params, settings);
+            };
+        },
+    }, { force: true });
+
+    const wowlEnv = makeEnv();
+    wowlEnv.qweb.addTemplates(await loadBundleTemplates("web.assets_frontend"));
+    await startServices(wowlEnv);
+    mapLegacyEnvToWowlEnv(legacyEnv, wowlEnv);
+
+    const adapter = new ComponentAdapter(null, { Component }); // Used for _trigger_up compat layer
+    const publicRoot = new RootWidget(adapter);
+    await Promise.all([
+        mount(MainComponentsContainer, {
+            target: document.body,
+            env: wowlEnv,
+        }),
+        publicRoot.attachTo(document.body),
+    ]);
+    return publicRoot;
+}
+
+__exports[Symbol.for("default")] = { PublicRoot, createPublicRoot };
+
+return __exports;
+});
+
+odoo.define(`web.public.root`, async function(require) {
+                        return require('@web/legacy/js/public/public_root')[Symbol.for("default")];
+                        });
+;
+
+/***********************************************************************
+*  Filepath: /web/static/src/legacy/js/public/public_root_instance.js  *
+*  Bundle: web.report_assets_common                                    *
+*  Lines: 14                                                           *
+***********************************************************************/
+odoo.define('@web/legacy/js/public/public_root_instance', async function (require) {
+'use strict';
+let __exports = {};
+/** @odoo-module alias=root.widget */
+const { PublicRoot, createPublicRoot } = require("@web/legacy/js/public/public_root");
+
+__exports[Symbol.for("default")] = createPublicRoot(PublicRoot);
+
+return __exports;
+});
+
+odoo.define(`root.widget`, async function(require) {
+                        return require('@web/legacy/js/public/public_root_instance')[Symbol.for("default")];
+                        });
+;
+
+/****************************************************************
+*  Filepath: /web/static/src/legacy/js/public/public_widget.js  *
+*  Bundle: web.report_assets_common                             *
+*  Lines: 294                                                   *
+****************************************************************/
+odoo.define('@web/legacy/js/public/public_widget', async function (require) {
+'use strict';
+let __exports = {};
+/** @odoo-module alias=web.public.widget */
+
+/**
+ * Provides a way to start JS code for public contents.
+ */
+
+const dom = require('web.dom');
+const session = require('web.session');
+const Widget = require('web.Widget');
+
+/**
+ * Specialized Widget which automatically instantiates child widgets to attach
+ * to internal DOM elements once it is started. The widgets to instantiate are
+ * known thanks to a linked registry which contains info about the widget
+ * classes and jQuery selectors to use to find the elements to attach them to.
+ *
+ * @todo Merge with 'PublicWidget' ?
+ */
+var RootWidget = Widget.extend({
+    /**
+     * @constructor
+     */
+    init: function () {
+        this._super.apply(this, arguments);
+        this._widgets = [];
+    },
+    /**
+     * @override
+     * @see _attachComponents
+     */
+    start: function () {
+        var defs = [this._super.apply(this, arguments)];
+
+        defs.push(this._attachComponents());
+        this._getRegistry().on("UPDATE", this, ({ operation, value }) => {
+            if (operation === "add") {
+                this._attachComponent(value);
+            }
+        });
+
+        return Promise.all(defs);
+    },
+
+    //--------------------------------------------------------------------------
+    // Private
+    //--------------------------------------------------------------------------
+
+    /**
+     * Instantiates a child widget according to the given registry data.
+     *
+     * @private
+     * @param {Object} childInfo
+     * @param {function} childInfo.Widget - the widget class to instantiate
+     * @param {string} childInfo.selector
+     *        the jQuery selector to use to find the internal DOM element which
+     *        needs to be attached to the instantiated widget
+     * @param {jQuery} [$from] - only check DOM elements which are descendant of
+     *                         the given one. If not given, use this.$el.
+     * @returns {Deferred}
+     */
+    _attachComponent: function (childInfo, $from) {
+        var self = this;
+        var $elements = dom.cssFind($from || this.$el, childInfo.selector);
+        var defs = _.map($elements, function (element) {
+            var w = new childInfo.Widget(self);
+            self._widgets.push(w);
+            return w.attachTo(element);
+        });
+        return Promise.all(defs);
+    },
+    /**
+     * Instantiates the child widgets that need to be according to the linked
+     * registry.
+     *
+     * @private
+     * @param {jQuery} [$from] - only check DOM elements which are descendant of
+     *                         the given one. If not given, use this.$el.
+     * @returns {Deferred}
+     */
+    _attachComponents: function ($from) {
+        var self = this;
+        var childInfos = this._getRegistry().getAll();
+        var defs = _.map(childInfos, function (childInfo) {
+            return self._attachComponent(childInfo, $from);
+        });
+        return Promise.all(defs);
+    },
+    /**
+     * Returns the `RootWidgetRegistry` instance that is linked to this
+     * `RootWidget` instance.
+     *
+     * @abstract
+     * @private
+     * @returns {RootWidgetRegistry}
+     */
+    _getRegistry: function () {},
+});
+
+//::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+/**
+ * Provides a way for executing code once a website DOM element is loaded in the
+ * dom.
+ */
+var PublicWidget = Widget.extend({
+    /**
+     * The selector attribute, if defined, allows to automatically create an
+     * instance of this widget on page load for each DOM element which
+     * matches this selector. The `PublicWidget.$target` element will then be
+     * that particular DOM element. This should be the main way of instantiating
+     * `PublicWidget` elements.
+     *
+     * @todo do not make this part of the Widget but rather an info to give when
+     * registering the widget.
+     */
+    selector: false,
+    /**
+     * Extension of @see Widget.events
+     *
+     * A description of the event handlers to bind/delegate once the widget
+     * has been rendered::
+     *
+     *   'click .hello .world': 'async _onHelloWorldClick',
+     *     _^_      _^_           _^_        _^_
+     *      |        |             |          |
+     *      |  (Optional) jQuery   |  Handler method name
+     *      |  delegate selector   |
+     *      |                      |_ (Optional) space separated options
+     *      |                          * async: use the automatic system
+     *      |_ Event name with           making handlers promise-ready (see
+     *         potential jQuery          makeButtonHandler, makeAsyncHandler)
+     *         namespaces
+     *
+     * Note: the values may be replaced by a function declaration. This is
+     * however a deprecated behavior.
+     *
+     * @type {Object}
+     */
+    events: {},
+
+    /**
+     * @constructor
+     * @param {Object} parent
+     * @param {Object} [options]
+     */
+    init: function (parent, options) {
+        this._super.apply(this, arguments);
+        this.options = options || {};
+    },
+    /**
+     * Destroys the widget and basically restores the target to the state it
+     * was before the start method was called (unlike standard widget, the
+     * associated $el DOM is not removed, if this was instantiated thanks to the
+     * selector property).
+     */
+    destroy: function () {
+        if (this.selector) {
+            var $oldel = this.$el;
+            // The difference with the default behavior is that we unset the
+            // associated element first so that:
+            // 1) its events are unbinded
+            // 2) it is not removed from the DOM
+            this.setElement(null);
+        }
+
+        this._super.apply(this, arguments);
+
+        if (this.selector) {
+            // Reassign the variables afterwards to allow extensions to use them
+            // after calling the _super method
+            this.$el = $oldel;
+            this.el = $oldel[0];
+            this.$target = this.$el;
+            this.target = this.el;
+        }
+    },
+    /**
+     * @override
+     */
+    setElement: function () {
+        this._super.apply(this, arguments);
+        if (this.selector) {
+            this.$target = this.$el;
+            this.target = this.el;
+        }
+    },
+
+    //--------------------------------------------------------------------------
+    // Private
+    //--------------------------------------------------------------------------
+
+    /**
+     * @see this.events
+     * @override
+     */
+    _delegateEvents: function () {
+        var self = this;
+        var originalEvents = this.events;
+
+        var events = {};
+        _.each(this.events, function (method, event) {
+            // If the method is a function, use the default Widget system
+            if (typeof method !== 'string') {
+                events[event] = method;
+                return;
+            }
+            // If the method is only a function name without options, use the
+            // default Widget system
+            var methodOptions = method.split(' ');
+            if (methodOptions.length <= 1) {
+                events[event] = method;
+                return;
+            }
+            // If the method has no meaningful options, use the default Widget
+            // system
+            var isAsync = _.contains(methodOptions, 'async');
+            if (!isAsync) {
+                events[event] = method;
+                return;
+            }
+
+            method = self.proxy(methodOptions[methodOptions.length - 1]);
+            if (_.str.startsWith(event, 'click')) {
+                // Protect click handler to be called multiple times by
+                // mistake by the user and add a visual disabling effect
+                // for buttons.
+                method = dom.makeButtonHandler(method);
+            } else {
+                // Protect all handlers to be recalled while the previous
+                // async handler call is not finished.
+                method = dom.makeAsyncHandler(method);
+            }
+            events[event] = method;
+        });
+
+        this.events = events;
+        this._super.apply(this, arguments);
+        this.events = originalEvents;
+    },
+    /**
+     * @private
+     * @param {boolean} [extra=false]
+     * @param {Object} [extraContext]
+     * @returns {Object}
+     */
+    _getContext: function (extra, extraContext) {
+        var context;
+        this.trigger_up('context_get', {
+            extra: extra || false,
+            context: extraContext,
+            callback: function (ctx) {
+                context = ctx;
+            },
+        });
+        return context;
+    },
+});
+
+//::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
+/**
+ * The registry object contains the list of widgets that should be instantiated
+ * thanks to their selector property if any.
+ */
+var registry = {};
+
+/**
+ * This is a fix for apple device (<= IPhone 4, IPad 2)
+ * Standard bootstrap requires data-toggle='collapse' element to be <a/> tags.
+ * Unfortunatly some layouts use a <div/> tag instead. The fix forces an empty
+ * click handler on these div, which allows standard bootstrap to work.
+ */
+registry._fixAppleCollapse = PublicWidget.extend({
+    selector: 'div[data-toggle="collapse"]',
+    events: {
+        'click': function () {},
+    },
+});
+
+__exports[Symbol.for("default")] = {
+    RootWidget: RootWidget,
+    Widget: PublicWidget,
+    registry: registry,
+};
+
+return __exports;
+});
+
+odoo.define(`web.public.widget`, async function(require) {
+                        return require('@web/legacy/js/public/public_widget')[Symbol.for("default")];
+                        });
+;
+
+/********************************************************
+*  Filepath: /web/static/src/legacy/js/report/utils.js  *
+*  Bundle: web.report_assets_common                     *
+*  Lines: 26                                            *
+********************************************************/
+odoo.define('report.utils', function (require) {
+'use strict';
+
+function get_protocol_from_url (url) {
+    var a = document.createElement('a');
+    a.href = url;
+    return a.protocol;
+}
+
+function get_host_from_url (url) {
+    var a = document.createElement('a');
+    a.href = url;
+    return a.host;
+}
+
+function build_origin (protocol, host) {
+    return protocol + '//' + host;
+}
+
+return {
+    'get_protocol_from_url': get_protocol_from_url,
+    'get_host_from_url': get_host_from_url,
+    'build_origin': build_origin,
+};
+
+});
+;
+
+/*********************************************************
+*  Filepath: /web/static/src/legacy/js/report/report.js  *
+*  Bundle: web.report_assets_common                      *
+*  Lines: 42                                             *
+*********************************************************/
+odoo.define('report', function (require) {
+'use strict';
+
+require('web.dom_ready');
+var utils = require('report.utils');
+
+if (window.self === window.top) {
+    return;
+}
+
+$(document.body)
+    .addClass('o_in_iframe')
+    .addClass('container-fluid')
+    .removeClass('container');
+
+var web_base_url = window.origin;
+var trusted_host = utils.get_host_from_url(web_base_url);
+var trusted_protocol = utils.get_protocol_from_url(web_base_url);
+var trusted_origin = utils.build_origin(trusted_protocol, trusted_host);
+
+// Allow sending commands to the webclient
+// `do_action` command
+$('[res-id][res-model][view-type]')
+    .wrap('<a/>')
+    .attr('href', '#')
+    .on('click', function (ev) {
+        ev.preventDefault();
+        var action = {
+            'type': 'ir.actions.act_window',
+            'view_mode': $(this).attr('view-mode') || $(this).attr('view-type'),
+            'res_id': Number($(this).attr('res-id')),
+            'res_model': $(this).attr('res-model'),
+            'views': [
+                [$(this).attr('view-id') || false, $(this).attr('view-type')],
+            ],
+        };
+        window.parent.postMessage({
+            'message': 'report:do_action',
+            'action': action,
+        }, trusted_origin);
+    });
+});
+
+//# sourceMappingURL=/web/assets/129-c7dae4f/web.report_assets_common.js.map

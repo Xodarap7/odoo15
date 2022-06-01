@@ -1,0 +1,29 @@
+# Ansible managed
+version: '3.7'
+
+services:
+  odoo:
+    build:
+      context: './docker'
+      args:
+        HOST_UID: 1000
+    restart: unless-stopped
+    volumes:
+      - "./etc/odoo.conf:/etc/odoo/odoo.conf:ro"
+      - "./local-addons:/mnt/extra-addons"
+      - "./data:/var/lib/odoo/data"
+    depends_on:
+      - db
+    env_file:
+      - ".env"
+    ports:
+      - 127.0.0.15:8015:8015
+
+  db:
+    image: postgres:14
+    
+    restart: unless-stopped
+    volumes:
+      - "./pg_data:/var/lib/postgresql/data"
+    env_file:
+      - ".env"
